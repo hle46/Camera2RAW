@@ -40,7 +40,11 @@ import android.view.Surface;
 import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.SeekBar;
+import android.widget.Button;
+import android.widget.CompoundButton;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -48,16 +52,27 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Date;
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
+import static edu.illinois.sba.camera2raw.Native.saveImageAsBin;
+import static edu.illinois.sba.camera2raw.Native.saveImageAsCSV;
+
+
 public class CameraActivityFragment extends Fragment
         implements View.OnClickListener {
+    static {
+        System.loadLibrary("raw");
+    }
 
     /**
      * Conversion from screen rotation to JPEG orientation.
@@ -71,6 +86,51 @@ public class CameraActivityFragment extends Fragment
         ORIENTATIONS.append(Surface.ROTATION_180, 270);
         ORIENTATIONS.append(Surface.ROTATION_270, 180);
     }
+
+    /**
+     * UI stuffs
+     */
+    private Switch mExposureSwitch;
+    private Switch mBurstSwitch;
+    private LinearLayout mExposureLinearLayout;
+    private LinearLayout mBurstLinearLayout;
+    private TextView mExposureTextView;
+    private TextView mBurstTextView;
+    private FrameLayout control;
+
+    private boolean isAutoExposure() {
+        return mExposureSwitch.isChecked();
+    }
+
+    private boolean isBurstMode() {
+        return mBurstSwitch.isChecked();
+    }
+
+    private void setEnabledLinearLayout(LinearLayout ll, boolean b) {
+        for ( int i = 0; i < ll.getChildCount();  i++ ){
+            View childView = ll.getChildAt(i);
+            childView.setEnabled(b);
+        }
+    }
+
+    private void setEnabledFrameLayout(FrameLayout fl, boolean b) {
+        for ( int i = 0; i < fl.getChildCount();  i++ ){
+            View childView = fl.getChildAt(i);
+            childView.setEnabled(b);
+        }
+    }
+
+
+    // Durations in nanoseconds
+    private static final long MICRO_SECOND = 1000;
+    private static final long MILLI_SECOND = MICRO_SECOND * 1000;
+    private static final long ONE_SECOND = MILLI_SECOND * 1000;
+
+    private ArrayList<Long> mExposureTimes;
+    private int mCurExposureIdx;
+
+    private int mCurMaxBurst;
+
 
     /**
      * Tag for the {@link Log}.
@@ -88,9 +148,19 @@ public class CameraActivityFragment extends Fragment
     private static final int STATE_WAITING_LOCK = 1;
 
     /**
+     * Camera state: Waiting for the exposure to be precapture state.
+     */
+    private static final int STATE_WAITING_PRECAPTURE = 2;
+
+    /**
+     * Camera state: Waiting for the exposure state to be something other than precapture.
+     */
+    private static final int STATE_WAITING_NON_PRECAPTURE = 3;
+
+    /**
      * Camera state: Picture was taken.
      */
-    private static final int STATE_PICTURE_TAKEN = 2;
+    private static final int STATE_PICTURE_TAKEN = 4;
 
     /**
      * {@link TextureView.SurfaceTextureListener} handles several lifecycle events on a
@@ -146,11 +216,6 @@ public class CameraActivityFragment extends Fragment
     private CameraCharacteristics mCameraCharacteristics;
 
     /**
-     * A CaptureResult to save result of capturing
-     */
-    private TotalCaptureResult mCaptureResult;
-
-    /**
      * The {@link android.util.Size} of camera preview.
      */
     private Size mPreviewSize;
@@ -202,26 +267,17 @@ public class CameraActivityFragment extends Fragment
      * An {@link ImageReader} that handles still image capture.
      */
     private ImageReader mImageReader;
-
+    private ImageReader mImageReaderJPEG;
     /**
      * Number of images in a burst
      */
-    private final int numBurstImages = 6;
+    private final int maxBurstImages = 8;
 
     /**
      * Current image
      */
     private int imageNum = 0;
-    private int savedImageNum = 0;
-
-
-    private SeekBar mSeekBar;
-    private long mLowerExposureTime;
-    private long mUpperExposureTime;
-
-    private long mMinFrameDuration;
-    private long mMaxFrameDuration;
-
+    private int imageCount;
     /**
      * This a callback object for the {@link ImageReader}. "onImageAvailable" will be called when a
      * still image is ready to be saved.
@@ -232,11 +288,25 @@ public class CameraActivityFragment extends Fragment
         @Override
         public void onImageAvailable(ImageReader reader) {
             Log.d(TAG, "onImageAvailable");
-            ++savedImageNum;
-            File mFile = new File(getActivity().getExternalFilesDir(null), "pic" + savedImageNum + ".dng");
-            mBackgroundHandler.post(new ImageSaver(reader.acquireNextImage(), mFile, mCameraCharacteristics, mCaptureResult, getActivity()));
-            if (savedImageNum == numBurstImages) {
-                savedImageNum = 0;
+            ++imageCount;
+            Log.d(TAG, "Produce Count: " + imageCount);
+        }
+
+    };
+    private int jpegCount = 0;
+    private final ImageReader.OnImageAvailableListener mOnImageAvailableListenerJPEG
+            = new ImageReader.OnImageAvailableListener() {
+
+        @Override
+        public void onImageAvailable(ImageReader reader) {
+
+            if (isBurstMode()) {
+                mBackgroundHandler.post(new ImageSaverJPEG(reader.acquireNextImage(), new File(getActivity().getExternalFilesDir(null), mFilePrefix + "_" + (++jpegCount) + ".jpg"), getActivity()));
+                if (jpegCount == mCurMaxBurst) {
+                    jpegCount = 0;
+                }
+            } else {
+                mBackgroundHandler.post(new ImageSaverJPEG(reader.acquireNextImage(), new File(getActivity().getExternalFilesDir(null), mFilePrefix + ".jpg"), getActivity()));
             }
         }
 
@@ -249,6 +319,7 @@ public class CameraActivityFragment extends Fragment
 
     /**
      * {@link CaptureRequest} generated by {@link #mPreviewRequestBuilder}
+     * to cache the lastest preview CaptureRequest
      */
     private CaptureRequest mPreviewRequest;
 
@@ -278,28 +349,47 @@ public class CameraActivityFragment extends Fragment
                 }
                 case STATE_WAITING_LOCK: {
                     Integer afState = result.get(CaptureResult.CONTROL_AF_STATE);
-                    Log.d(TAG, "AFState: " + afState);
                     if (afState == null) {
-                        /** Oops! Auto focus state is null. What The Facebook!
-                         *  Go back to preview, please!
-                         */
-                        mState = STATE_PREVIEW;
-                    } else if (CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED == afState) {
-                        /** Oops! AF has failed to focus successfully and has locked focus.
-                         *  What The Facebook! Go back to wait for focus again, please!
-                         */
-                        mState = STATE_WAITING_LOCK;
+                        captureStillPicture();
+                    } else if (CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED == afState ||
+                            CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED == afState) {
+                        if (isAutoExposure()) {
+                            // CONTROL_AE_STATE can be null on some devices
+                            Integer aeState = result.get(CaptureResult.CONTROL_AE_STATE);
+                            if (aeState == null ||
+                                    aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED) {
+                                mState = STATE_PICTURE_TAKEN;
+                                captureStillPicture();
+                            } else {
+                                runPrecaptureSequence();
+                            }
+                        } else {
+                            mState = STATE_PICTURE_TAKEN;
+                            captureStillPicture();
+                        }
                     }
-                    else if (CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED == afState) {
-                        /** Good to go!
-                         *  AF believes it is focused correctly and has locked focus.
-                         */
+                    break;
+                }
+                case STATE_WAITING_PRECAPTURE: {
+                    // CONTROL_AE_STATE can be null on some devices
+                    Integer aeState = result.get(CaptureResult.CONTROL_AE_STATE);
+                    if (aeState == null ||
+                            aeState == CaptureResult.CONTROL_AE_STATE_PRECAPTURE ||
+                            aeState == CaptureRequest.CONTROL_AE_STATE_FLASH_REQUIRED) {
+                        mState = STATE_WAITING_NON_PRECAPTURE;
+                    }
+                    break;
+                }
+                case STATE_WAITING_NON_PRECAPTURE: {
+                    // CONTROL_AE_STATE can be null on some devices
+                    Integer aeState = result.get(CaptureResult.CONTROL_AE_STATE);
+                    if (aeState == null || aeState != CaptureResult.CONTROL_AE_STATE_PRECAPTURE) {
                         mState = STATE_PICTURE_TAKEN;
                         captureStillPicture();
                     }
-                    // else go back to wait
                     break;
                 }
+
             }
         }
 
@@ -318,6 +408,24 @@ public class CameraActivityFragment extends Fragment
         }
 
     };
+
+    /**
+     * Run the precapture sequence for capturing a still image. This method should be called when
+     * we get a response in {@link #mCaptureCallback} from {@link #lockFocus()}.
+     */
+    private void runPrecaptureSequence() {
+        try {
+            // This is how to tell the camera to trigger.
+            mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER,
+                    CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_START);
+            // Tell #mCaptureCallback to wait for the precapture sequence to be set.
+            mState = STATE_WAITING_PRECAPTURE;
+            mCaptureSession.capture(mPreviewRequestBuilder.build(), mCaptureCallback,
+                    mBackgroundHandler);
+        } catch (CameraAccessException e) {
+            e.printStackTrace();
+        }
+    }
 
     /**
      * Shows a {@link Toast} on the UI thread.
@@ -382,29 +490,129 @@ public class CameraActivityFragment extends Fragment
     public void onViewCreated(final View view, Bundle savedInstanceState) {
         view.findViewById(R.id.picture).setOnClickListener(this);
         mTextureView = (AutoFitTextureView) view.findViewById(R.id.texture);
-        mSeekBar = (SeekBar) view.findViewById(R.id.exposureTimeSeekBar);
-        final TextView mTextView = (TextView) view.findViewById(R.id.exposureTimeTextView);
-        mSeekBar.setOnSeekBarChangeListener(
-                new SeekBar.OnSeekBarChangeListener() {
+
+        mExposureSwitch = (Switch) view.findViewById(R.id.exposureSwitch);
+        mExposureLinearLayout = (LinearLayout) view.findViewById(R.id.exposureLinearLayout);
+        setEnabledLinearLayout(mExposureLinearLayout, !isAutoExposure());
+        mExposureSwitch.setOnCheckedChangeListener(
+                new CompoundButton.OnCheckedChangeListener() {
                     @Override
-                    public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                        double exposureTime = progress * (mUpperExposureTime - mLowerExposureTime) / 100.0 + mLowerExposureTime;
+                    public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
+                        setEnabledLinearLayout(mExposureLinearLayout, !isChecked);
+                        try {
+                            mCaptureSession.stopRepeating();
+                            // Adjust exposure parameters appropriately based on exposure mode
+                            setExposureAppropriately(mPreviewRequestBuilder);
 
-                        mTextView.setText("Exposure Time: " + ((long) exposureTime) + " ns");
-                    }
-
-                    @Override
-                    public void onStartTrackingTouch(SeekBar seekBar) {
-
-                    }
-
-                    @Override
-                    public void onStopTrackingTouch(SeekBar seekBar) {
-
+                            // Finally, we start displaying the camera preview.
+                            mPreviewRequest = mPreviewRequestBuilder.build();
+                            mCaptureSession.setRepeatingRequest(mPreviewRequest,
+                                    mCaptureCallback, mBackgroundHandler);
+                        } catch (CameraAccessException e) {
+                            e.printStackTrace();
+                        }
                     }
                 }
         );
 
+        mExposureTextView = (TextView) view.findViewById(R.id.exposureTextView);
+
+
+        Button mExposureButtonLess = (Button) view.findViewById(R.id.exposureButtonLess);
+        mExposureButtonLess.setOnClickListener(
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        if (mCurExposureIdx == 0) {
+                            showToast("Reach minimum of manual exposure time");
+                            return;
+                        }
+                        --mCurExposureIdx;
+                        showExposureTime(mExposureTimes.get(mCurExposureIdx));
+                        // Adjust exposure parameters appropriately based on exposure mode
+                        setExposureAppropriately(mPreviewRequestBuilder);
+
+                        // Finally, we start displaying the camera preview.
+                        mPreviewRequest = mPreviewRequestBuilder.build();
+                        try {
+                            mCaptureSession.setRepeatingRequest(mPreviewRequest,
+                                    mCaptureCallback, mBackgroundHandler);
+                        } catch (CameraAccessException e) {
+                            e.printStackTrace();
+                        }
+                    }
+                }
+        );
+        Button mExposureButtonGreater = (Button) view.findViewById(R.id.exposureButtonGreater);
+        mExposureButtonGreater.setOnClickListener(
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        if (mCurExposureIdx == (mExposureTimes.size() - 1)) {
+                            showToast("Reach maximum of manual exposure time");
+                            return;
+                        }
+                        ++mCurExposureIdx;
+                        showExposureTime(mExposureTimes.get(mCurExposureIdx));
+                        // Adjust exposure parameters appropriately based on exposure mode
+                        setExposureAppropriately(mPreviewRequestBuilder);
+
+                        // Finally, we start displaying the camera preview.
+                        mPreviewRequest = mPreviewRequestBuilder.build();
+                        try {
+                            mCaptureSession.setRepeatingRequest(mPreviewRequest,
+                                    mCaptureCallback, mBackgroundHandler);
+                        } catch (CameraAccessException e) {
+                            e.printStackTrace();
+                        }
+                    }
+                }
+        );
+
+
+
+        mBurstSwitch = (Switch) view.findViewById(R.id.burstSwitch);
+        mBurstLinearLayout = (LinearLayout) view.findViewById(R.id.burstLinearLayout);
+        setEnabledLinearLayout(mBurstLinearLayout, isBurstMode());
+        mBurstSwitch.setOnCheckedChangeListener(
+                new CompoundButton.OnCheckedChangeListener() {
+                    @Override
+                    public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
+                        setEnabledLinearLayout(mBurstLinearLayout, isChecked);
+                    }
+                }
+        );
+
+        mBurstTextView = (TextView) view.findViewById(R.id.burstTextView);
+        mCurMaxBurst = maxBurstImages / 2;
+        mBurstTextView.setText(String.format("%d", mCurMaxBurst));
+        Button mBurstButtonLess = (Button) view.findViewById(R.id.burstButtonLess);
+        mBurstButtonLess.setOnClickListener(
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        if (mCurMaxBurst == 1) {
+                            showToast("Reach minimum of burst");
+                            return;
+                        }
+                        mBurstTextView.setText(String.format("%d", --mCurMaxBurst));
+                    }
+                }
+        );
+        Button mBurstButtonGreater = (Button) view.findViewById(R.id.burstButtonGreater);
+        mBurstButtonGreater.setOnClickListener(
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        if (mCurMaxBurst == maxBurstImages) {
+                            showToast("Reach maximum of burst");
+                            return;
+                        }
+                        mBurstTextView.setText(String.format("%d", ++mCurMaxBurst));
+                    }
+                }
+        );
+        control = (FrameLayout) view.findViewById(R.id.control);
 
     }
 
@@ -436,6 +644,20 @@ public class CameraActivityFragment extends Fragment
         super.onPause();
     }
 
+    private void showExposureTime(long exposureTime) {
+        // Format exposure time nicely
+        String exposureText;
+        if (exposureTime > ONE_SECOND) {
+            exposureText = String.format("%.0f s", exposureTime / 1e9);
+        } else if (exposureTime > MILLI_SECOND) {
+            exposureText = String.format("%.0f ms", exposureTime / 1e6);
+        } else if (exposureTime > MICRO_SECOND) {
+            exposureText = String.format("%.0f us", exposureTime / 1e3);
+        } else {
+            exposureText = String.format("%d ns", exposureTime);
+        }
+        mExposureTextView.setText(exposureText);
+    }
     /**
      * Sets up member variables related to camera.
      *
@@ -465,22 +687,43 @@ public class CameraActivityFragment extends Fragment
                 // Get the range of image exposure times supported by this camera device.
                 Range<Long> range = characteristics.get(
                         CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
-                mLowerExposureTime = range.getLower();
-                mUpperExposureTime = range.getUpper();
+                long lowerExposureTime = range.getLower();
+                long upperExposureTime = range.getUpper();
+
+                // Setup exposure times
+
+                long[] mStandardExposureTimes = new long[]{50 * MICRO_SECOND, 100 * MICRO_SECOND, 200 * MICRO_SECOND,
+                        400 * MICRO_SECOND, 800 * MICRO_SECOND, MILLI_SECOND, 5 * MILLI_SECOND, 10 * MILLI_SECOND,
+                        20 * MILLI_SECOND, 40 * MILLI_SECOND, 80 * MILLI_SECOND, 100 * MILLI_SECOND, 200 * MILLI_SECOND, 300 * MILLI_SECOND,
+                        400 * MILLI_SECOND, 500 * MILLI_SECOND, 600 * MILLI_SECOND, 650 * MILLI_SECOND};
+                mExposureTimes = new ArrayList<>();
+                for (long exposureTime : mStandardExposureTimes) {
+                    if (exposureTime > lowerExposureTime && exposureTime < upperExposureTime) {
+                        mExposureTimes.add(exposureTime);
+                    }
+                }
+                mCurExposureIdx = mExposureTimes.size() / 2;
+                showExposureTime(mExposureTimes.get(mCurExposureIdx));
+
+
 
                 // For still image captures, we use the largest available size.
                 Size largest = Collections.max(
                         Arrays.asList(map.getOutputSizes(ImageFormat.RAW_SENSOR)),
                         new CompareSizesByArea());
-
-                // Get minimum and maximum duration frame
-                mMinFrameDuration = map.getOutputMinFrameDuration(ImageFormat.RAW_SENSOR, largest);
-                mMaxFrameDuration = characteristics.get(CameraCharacteristics.SENSOR_INFO_MAX_FRAME_DURATION);
                 
                 mImageReader = ImageReader.newInstance(largest.getWidth(), largest.getHeight(),
-                        ImageFormat.RAW_SENSOR, /*maxImages*/numBurstImages);
+                        ImageFormat.RAW_SENSOR, /*maxImages*/maxBurstImages + 1);
                 mImageReader.setOnImageAvailableListener(
-                        mOnImageAvailableListener, mBackgroundHandler);
+                        mOnImageAvailableListener, null); // Run on main thread
+
+                Size largestJPEG = Collections.max(
+                        Arrays.asList(map.getOutputSizes(ImageFormat.JPEG)),
+                        new CompareSizesByArea());
+                mImageReaderJPEG = ImageReader.newInstance(largestJPEG.getWidth(), largestJPEG.getHeight(),
+                        ImageFormat.JPEG, /*maxImages*/ maxBurstImages + 1);
+                mImageReaderJPEG.setOnImageAvailableListener(
+                        mOnImageAvailableListenerJPEG, mBackgroundHandler);
 
                 // Danger, W.R.! Attempting to use too large a preview size could  exceed the camera
                 // bus' bandwidth limitation, resulting in gorgeous previews but the storage of
@@ -602,7 +845,7 @@ public class CameraActivityFragment extends Fragment
             mPreviewRequestBuilder.addTarget(surface);
 
             // Here, we create a CameraCaptureSession for camera preview.
-            mCameraDevice.createCaptureSession(Arrays.asList(surface, mImageReader.getSurface()),
+            mCameraDevice.createCaptureSession(Arrays.asList(surface, mImageReader.getSurface(), mImageReaderJPEG.getSurface()),
                     new CameraCaptureSession.StateCallback() {
 
                         @Override
@@ -619,28 +862,15 @@ public class CameraActivityFragment extends Fragment
                                 mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE,
                                         CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
 
-                                // TODO:
-                                // When user changes exposure time on the slidebar to some value,
-                                // should I set exposure time for preview frame based on that value ???
-                                // I manually control the exposure time for the preview frame but I
-                                // couldn't manage to get it work. Thus, I just let the system to
-                                // control the exposure time for now.
-
-                                // To turn off flash, CONTROL_AE_MODE can only be ON or OFF
-                                // https://developer.android.com/reference/android/hardware/camera2/CaptureRequest.html#FLASH_MODE
-                                mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
-                                        CaptureRequest.CONTROL_AE_MODE_ON);
+                                // Turn off auto white balance
+                                mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF);
 
                                 // Turn off flash,
                                 mPreviewRequestBuilder.set(CaptureRequest.FLASH_MODE,
                                         CaptureRequest.FLASH_MODE_OFF);
 
-                                // Turn off antibanding
-                                mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE,
-                                        CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_OFF);
-
-                                // Turn off auto white balance
-                                mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF);
+                                // Adjust exposure parameters appropriately based on exposure mode
+                                setExposureAppropriately(mPreviewRequestBuilder);
 
                                 // Finally, we start displaying the camera preview.
                                 mPreviewRequest = mPreviewRequestBuilder.build();
@@ -660,6 +890,22 @@ public class CameraActivityFragment extends Fragment
             );
         } catch (CameraAccessException e) {
             e.printStackTrace();
+        }
+    }
+
+    private void setExposureAppropriately(CaptureRequest.Builder builder) {
+        if (isAutoExposure()) {
+            // To turn off flash, CONTROL_AE_MODE can only be ON or OFF
+            // https://developer.android.com/reference/android/hardware/camera2/CaptureRequest.html#FLASH_MODE
+            builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+
+            // Turn off antibanding
+            builder.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_OFF);
+        } else { // Manual exposure
+            builder.set(CaptureRequest.CONTROL_AE_MODE,
+                    CaptureRequest.CONTROL_AE_MODE_OFF);
+            builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, mExposureTimes.get(mCurExposureIdx));
+            builder.set(CaptureRequest.SENSOR_SENSITIVITY, 100);
         }
     }
 
@@ -696,11 +942,16 @@ public class CameraActivityFragment extends Fragment
         mTextureView.setTransform(matrix);
     }
 
+    private final SimpleDateFormat simpleDateFormat = new SimpleDateFormat("MM_dd_yyyy_hh_mm_ss");
+    private String mFilePrefix;
     /**
      * Initiate a still image capture.
      */
     private void takePicture() {
         lockFocus();
+        if (imageCount == 0) {
+            mFilePrefix = "IMG_" + simpleDateFormat.format(new Date());
+        }
     }
 
     /**
@@ -738,6 +989,7 @@ public class CameraActivityFragment extends Fragment
             final CaptureRequest.Builder captureBuilder =
                     mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
             captureBuilder.addTarget(mImageReader.getSurface());
+            captureBuilder.addTarget(mImageReaderJPEG.getSurface());
 
             captureBuilder.set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE,
                     CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON); // required for raw
@@ -757,40 +1009,10 @@ public class CameraActivityFragment extends Fragment
             // Turn off auto white balance
             captureBuilder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF);
 
-            // Turn off auto exposure
-            captureBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF);
-
-            // No need to turn off antibanding since manual exposure control is enabled as
-            // explained here:
-            // https://developer.android.com/reference/android/hardware/camera2/CaptureRequest.html#CONTROL_AE_ANTIBANDING_MODE
-
             // Turn off flash
             captureBuilder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF);
 
-            double exposureTime = mSeekBar.getProgress() *
-                    (mUpperExposureTime - mLowerExposureTime) / 100.0 + mLowerExposureTime;
-            captureBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, (long)exposureTime);
-
-            /** We need set the frame duration appropriately according to the exposure time.
-             *  I suspect that the system works like this:
-             *    - At the end of frame duration, onImageAvailable (callback of ImageReader)
-             *      will get fired.
-             *    - At the end of exposure time, onCaptureCompleted (callback of CameraCaptureSession)
-             *      will get fired.
-             *  I didn't set the frame duration before, so funny thing happened to me: image is
-             *  available before the capture completes when I set a long exposure time. This is because
-             *  my exposure time setting is bigger than the default frame duration.
-             *  I checked the minimum and maximum of frame duration, minimum frame duration is larger
-             *  than minimum exposure time and maximum frame duration is larger than the maximum exposure
-             *  time. So my simple algorithm for the system to work correctly is that:
-             *  Given a value of progress bar:
-             *  exposure time = progress * (maxExposureTime - minExposureTime) / 100.0 + minExposureTime
-             *  frame Duration = progress * (maxFrameDuration - minFrameDuration) / 100.0 + minFrameDuration
-             */
-
-            double frameDuration = mSeekBar.getProgress() *
-                    (mMaxFrameDuration - mMinFrameDuration) / 100.0 + mMinFrameDuration;
-            captureBuilder.set(CaptureRequest.SENSOR_FRAME_DURATION, (long) frameDuration);
+            setExposureAppropriately(captureBuilder);
 
             CameraCaptureSession.CaptureCallback CaptureCallback
                     = new CameraCaptureSession.CaptureCallback() {
@@ -798,12 +1020,26 @@ public class CameraActivityFragment extends Fragment
                 public void onCaptureCompleted(@NonNull CameraCaptureSession session,
                                                @NonNull CaptureRequest request,
                                                @NonNull TotalCaptureResult result) {
-                    mCaptureResult = result;
                     Log.d(TAG, "onCaptureCompleted");
+                    Log.d(TAG, "Consume count: " + imageCount);
+                    while (imageCount == 0) {
+                        // Wait
+                    }
+                    // Acquire next image
+                    --imageCount;
                     Log.d(TAG, "ImageNum: " + imageNum + " Real exposure time: " + result.get(CaptureResult.SENSOR_EXPOSURE_TIME));
-                    ++imageNum;
-                    if (imageNum >= numBurstImages) {
-                        imageNum = 0;
+                    if (isBurstMode()) {
+                        ++imageNum;
+                        File mFile = new File(getActivity().getExternalFilesDir(null), mFilePrefix + "_" + imageNum);
+                        mBackgroundHandler.post(new ImageSaver(mImageReader.acquireNextImage(), mFile, mCameraCharacteristics, result, getActivity()));
+                        if (imageNum == mCurMaxBurst) {
+                            imageNum = 0;
+                            unlockFocus();
+                        }
+
+                    } else {
+                        File mFile = new File(getActivity().getExternalFilesDir(null), mFilePrefix);
+                        mBackgroundHandler.post(new ImageSaver(mImageReader.acquireNextImage(), mFile, mCameraCharacteristics, result, getActivity()));
                         unlockFocus();
                     }
                 }
@@ -812,11 +1048,15 @@ public class CameraActivityFragment extends Fragment
             // Stop preview
             mCaptureSession.stopRepeating();
 
-            List<CaptureRequest> captureRequests = new ArrayList<>();
-            for (int i = 0; i < numBurstImages; ++i) {
-                captureRequests.add(captureBuilder.build());
+            if (isBurstMode()) {
+                List<CaptureRequest> captureRequests = new ArrayList<>();
+                for (int i = 0; i < mCurMaxBurst; ++i) {
+                    captureRequests.add(captureBuilder.build());
+                }
+                mCaptureSession.captureBurst(captureRequests, CaptureCallback, mBackgroundHandler);
+            } else {
+                mCaptureSession.capture(captureBuilder.build(), CaptureCallback, mBackgroundHandler);
             }
-            mCaptureSession.captureBurst(captureRequests, CaptureCallback, null);
         } catch (CameraAccessException e) {
             e.printStackTrace();
         }
@@ -843,11 +1083,26 @@ public class CameraActivityFragment extends Fragment
         }
     }
 
+    private ScheduledExecutorService scheduler;
+    private int countRepeat = 0;
     @Override
     public void onClick(View view) {
         switch (view.getId()) {
             case R.id.picture: {
-                takePicture();
+                setEnabledFrameLayout(control, false);
+                scheduler =
+                        Executors.newSingleThreadScheduledExecutor();
+
+                scheduler.scheduleWithFixedDelay
+                        (new Runnable() {
+                            public void run() {
+                                if (countRepeat++ == 60) {
+                                    scheduler.shutdown();
+                                    return;
+                                }
+                                takePicture();
+                            }
+                        }, 0, 30, TimeUnit.SECONDS);
                 break;
             }
         }
@@ -885,20 +1140,29 @@ public class CameraActivityFragment extends Fragment
         public void run() {
             DngCreator dngCreator = new DngCreator(mCameraCharacteristics, mCaptureResult);
             Image.Plane[] planes = mImage.getPlanes();
-            ByteBuffer x = planes[0].getBuffer();
-            Log.d(TAG, " " + x.isDirect());
+            ByteBuffer byteBuffer = planes[0].getBuffer();
 
+            int width = mImage.getWidth();
+            int height = mImage.getHeight();
+            /*
+            File mFileCSV = new File(mFile.getAbsolutePath() + ".csv");
+            saveImageAsCSV(mFileCSV.getAbsolutePath(), byteBuffer, width, height);
+            mActivity.sendBroadcast(new Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, Uri.fromFile(mFileCSV))); */
 
-            Log.d(TAG, "Format: " + mImage.getFormat() + ", " + planes[0]);
+            File mFileBin = new File(mFile.getAbsolutePath() + ".bin");
+            saveImageAsBin(mFileBin.getAbsolutePath(), byteBuffer, width, height);
+            mActivity.sendBroadcast(new Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, Uri.fromFile(mFileBin)));
 
+            File mFileDNG = new File(mFile.getAbsolutePath() + ".dng");
+            Log.d(TAG, mFileDNG + "");
             try {
-                FileOutputStream output = new FileOutputStream(mFile);
-                dngCreator.writeImage(output, mImage);
-                output.flush();
+                FileOutputStream outputDNG = new FileOutputStream(mFileDNG);
+                dngCreator.writeImage(outputDNG, mImage);
+                outputDNG.flush();
+                outputDNG.close();
                 dngCreator.close();
                 mImage.close();
-                output.close();
-                mActivity.sendBroadcast(new Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, Uri.fromFile(mFile)));
+                mActivity.sendBroadcast(new Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, Uri.fromFile(mFileDNG)));
             } catch (IOException e) {
                 e.printStackTrace();
             }
@@ -917,6 +1181,53 @@ public class CameraActivityFragment extends Fragment
             // We cast here to ensure the multiplications won't overflow
             return Long.signum((long) lhs.getWidth() * lhs.getHeight() -
                     (long) rhs.getWidth() * rhs.getHeight());
+        }
+
+    }
+
+    /**
+     * Saves a JPEG {@link Image} into the specified {@link File}.
+     */
+    private static class ImageSaverJPEG implements Runnable {
+
+        /**
+         * The JPEG image
+         */
+        private final Image mImage;
+        /**
+         * The file we save the image into.
+         */
+        private final File mFile;
+        private final Activity mActivity;
+
+        public ImageSaverJPEG(Image image, File file, Activity activity) {
+            mImage = image;
+            mFile = file;
+            mActivity = activity;
+        }
+
+        @Override
+        public void run() {
+            ByteBuffer buffer = mImage.getPlanes()[0].getBuffer();
+            byte[] bytes = new byte[buffer.remaining()];
+            buffer.get(bytes);
+            FileOutputStream output = null;
+            try {
+                output = new FileOutputStream(mFile);
+                output.write(bytes);
+            } catch (IOException e) {
+                e.printStackTrace();
+            } finally {
+                mImage.close();
+                if (null != output) {
+                    try {
+                        output.close();
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+            mActivity.sendBroadcast(new Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, Uri.fromFile(mFile)));
         }
 
     }
@@ -951,4 +1262,5 @@ public class CameraActivityFragment extends Fragment
         }
 
     }
+
 }
