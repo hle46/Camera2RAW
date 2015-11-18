@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <color name="title_color">#3030CDCD</color>
+    <color name="white">#FFFFFFFF</color>
     <color name="control_background">#000000</color>
     <color name="setting_background">#C0C0C0</color>
 </resources>

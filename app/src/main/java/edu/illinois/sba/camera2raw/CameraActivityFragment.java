@@ -31,6 +31,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.support.annotation.NonNull;
+import android.text.Editable;
 import android.util.Log;
 import android.util.Range;
 import android.util.Size;
@@ -42,6 +43,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.CompoundButton;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.Switch;
@@ -63,6 +65,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+
+import edu.illinois.sba.camera2raw.services.NetworkService;
 
 import static edu.illinois.sba.camera2raw.Native.saveImageAsBin;
 import static edu.illinois.sba.camera2raw.Native.saveImageAsCSV;
@@ -948,9 +952,13 @@ public class CameraActivityFragment extends Fragment
      * Initiate a still image capture.
      */
     private void takePicture() {
-        lockFocus();
         if (imageCount == 0) {
             mFilePrefix = "IMG_" + simpleDateFormat.format(new Date());
+        }
+        if (countRepeat == 0) {
+            lockFocus();
+        } else {
+            captureStillPicture();
         }
     }
 
@@ -1034,13 +1042,50 @@ public class CameraActivityFragment extends Fragment
                         mBackgroundHandler.post(new ImageSaver(mImageReader.acquireNextImage(), mFile, mCameraCharacteristics, result, getActivity()));
                         if (imageNum == mCurMaxBurst) {
                             imageNum = 0;
-                            unlockFocus();
+                            if (++countRepeat == maxRepeats) {
+                                unlockFocus();
+                                countRepeat = 0;
+                                scheduler.shutdown();
+                                getActivity().runOnUiThread(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        setEnabledFrameLayout(control, true);
+                                    }
+                                });
+                                return;
+                            }
+                            try {
+                                // After this, the camera will go back to the normal state of preview.
+                                mState = STATE_PREVIEW;
+                                mCaptureSession.setRepeatingRequest(mPreviewRequest, mCaptureCallback,
+                                        mBackgroundHandler);
+                            } catch (CameraAccessException e) {
+                                e.printStackTrace();
+                            }
                         }
 
                     } else {
                         File mFile = new File(getActivity().getExternalFilesDir(null), mFilePrefix);
                         mBackgroundHandler.post(new ImageSaver(mImageReader.acquireNextImage(), mFile, mCameraCharacteristics, result, getActivity()));
-                        unlockFocus();
+                        if (++countRepeat == maxRepeats) {
+                            unlockFocus();
+                            countRepeat = 0;
+                            scheduler.shutdown();
+                            getActivity().runOnUiThread(new Runnable() {
+                                @Override
+                                public void run() {
+                                    setEnabledFrameLayout(control, true);
+                                }
+                            });
+                            return;
+                        }
+                        try {
+                            mState = STATE_PREVIEW;
+                            mCaptureSession.setRepeatingRequest(mPreviewRequest, mCaptureCallback,
+                                    mBackgroundHandler);
+                        } catch (CameraAccessException e) {
+                            e.printStackTrace();
+                        }
                     }
                 }
             };
@@ -1085,10 +1130,14 @@ public class CameraActivityFragment extends Fragment
 
     private ScheduledExecutorService scheduler;
     private int countRepeat = 0;
+    private int maxRepeats;
     @Override
     public void onClick(View view) {
         switch (view.getId()) {
             case R.id.picture: {
+                EditText editText = (EditText) getView().findViewById(R.id.numRepeats);
+                maxRepeats = Integer.parseInt(editText.getText().toString());
+                Log.d(TAG, maxRepeats + "");
                 setEnabledFrameLayout(control, false);
                 scheduler =
                         Executors.newSingleThreadScheduledExecutor();
@@ -1096,10 +1145,6 @@ public class CameraActivityFragment extends Fragment
                 scheduler.scheduleWithFixedDelay
                         (new Runnable() {
                             public void run() {
-                                if (countRepeat++ == 60) {
-                                    scheduler.shutdown();
-                                    return;
-                                }
                                 takePicture();
                             }
                         }, 0, 30, TimeUnit.SECONDS);
@@ -1215,6 +1260,8 @@ public class CameraActivityFragment extends Fragment
             try {
                 output = new FileOutputStream(mFile);
                 output.write(bytes);
+                output.flush();
+                NetworkService.startActionUpload(mActivity, mFile.getAbsolutePath());
             } catch (IOException e) {
                 e.printStackTrace();
             } finally {
@@ -1228,6 +1275,7 @@ public class CameraActivityFragment extends Fragment
                 }
             }
             mActivity.sendBroadcast(new Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, Uri.fromFile(mFile)));
+
         }
 
     }

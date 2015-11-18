@@ -20,7 +20,7 @@ android {
     sourceSets.main.jni.srcDirs = []
 
     task ndkBuild(type: Exec, description: 'Compile JNI source via NDK') {
-        commandLine "ndk-build.cmd",
+        commandLine '/home/meowle/Android/Sdk/ndk-bundle/ndk-build',
                 'NDK_PROJECT_PATH=build/intermediates/ndk',
                 'NDK_LIBS_OUT=src/main/jniLibs',
                 'APP_BUILD_SCRIPT=src/main/jni/Android.mk',
@@ -28,7 +28,7 @@ android {
     }
 
     task ndkClean(type: Exec, description: 'Clean JNI via NDK') {
-        commandLine "ndk-build.cmd",
+        commandLine '/home/meowle/Android/Sdk/ndk-bundle/ndk-build',
                 'clean',
                 'NDK_PROJECT_PATH=build/intermediates/ndk',
                 'NDK_LIBS_OUT=src/main/jniLibs',
@@ -49,4 +49,5 @@ dependencies {
     testCompile 'junit:junit:4.12'
     compile 'com.android.support:appcompat-v7:23.1.0'
     compile 'com.android.support:design:23.1.0'
+    compile files('libs/dropbox-android-sdk-1.6.3.jar')
 }
